@@ -6,21 +6,13 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 
 contract AusdToken is ERC20, ERC20Burnable, ERC20Permit {
-    error NotDeployer();
-    error MinterAlreadySet();
-    error ZeroAddress();
     error NotMinter();
+    error ZeroAddress();
 
-    address public immutable deployer; // 部署者，仅用于设置一次 minter
-    address public minter;             // 主合约地址
-    bool    public minterSet;
+    address public minter;             // 当前主合约地址（可更换）
 
-    event MinterSet(address indexed minter);
+    event MinterChanged(address indexed oldMinter, address indexed newMinter);
 
-    /**
-     * @param name_   代币名
-     * @param symbol_ 代币符号
-     */
     constructor(
         string memory name_,
         string memory symbol_
@@ -28,24 +20,23 @@ contract AusdToken is ERC20, ERC20Burnable, ERC20Permit {
         ERC20(name_, symbol_)
         ERC20Permit(name_) // EIP-2612
     {
-        deployer = msg.sender;
+        minter = msg.sender; // 初始 minter 即部署者
+        emit MinterChanged(address(0), msg.sender);
     }
 
     function decimals() public pure override returns (uint8) {
         return 18;
     }
 
-    /// @notice 仅部署者可调用一次：将主合约地址设为唯一铸造者
-    function setMinterOnce(address minter_) external {
-        if (msg.sender != deployer) revert NotDeployer();
-        if (minterSet) revert MinterAlreadySet();
-        if (minter_ == address(0)) revert ZeroAddress();
-        minter = minter_;
-        minterSet = true;
-        emit MinterSet(minter_);
+    /// @notice 当前 minter 可更新新的 minter 地址
+    function setMinter(address newMinter) external {
+        if (msg.sender != minter) revert NotMinter();
+        if (newMinter == address(0)) revert ZeroAddress();
+        emit MinterChanged(minter, newMinter);
+        minter = newMinter;
     }
 
-    /// @notice 仅主合约（minter）可铸造
+    /// @notice 仅当前 minter 可铸造
     function mint(address to, uint256 amount) external {
         if (msg.sender != minter) revert NotMinter();
         _mint(to, amount);

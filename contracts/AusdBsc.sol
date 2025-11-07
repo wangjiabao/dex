@@ -97,7 +97,7 @@ contract AusdToken is ERC20, ERC20Burnable, ERC20Permit {
             initialFeeOwner == address(0)
         ) revert ZeroAddress();
 
-        usdt = 0x6e7f0e9a3487CAfE084994f76559E0F4d8cB3DCe;
+        usdt = 0x6D8E995C00F512CC4De6AC0C3D7Cc9F3D86C2A4c; // todo
         pancakeRouter = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
 
         // 需要 AUSD 地址 > USDT 地址，确保 pair 排序为 token0=USDT, token1=AUSD

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {AccessControl}   from "@openzeppelin/contracts/access/AccessControl.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
 /* -------------------- minimal interfaces -------------------- */
 interface IERC20 {
     function transfer(address to, uint256 value) external returns (bool);
@@ -16,44 +19,32 @@ interface IMintable {
     function mint(address to, uint256 amount) external;
 }
 
-/* ---------------------- ownable + reentrancy ---------------------- */
-abstract contract Ownable {
-    event OwnershipTransferred(address indexed prev, address indexed next);
-    address public owner;
-    constructor() { owner = msg.sender; emit OwnershipTransferred(address(0), msg.sender); }
-    modifier onlyOwner() { require(msg.sender == owner, "NOT_OWNER"); _; }
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "ZERO_ADDR");
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
-    }
-}
-
-abstract contract ReentrancyGuard {
-    uint256 private locked = 1;
-    modifier nonReentrant() {
-        require(locked == 1, "REENTRANT");
-        locked = 2;
-        _;
-        locked = 1;
-    }
+/* AUSD 需具备的 Ownable 接口（用来把所有权转走） */
+interface IOwnableLike {
+    function transferOwnership(address newOwner) external;
 }
 
 /**
  * @title BridgeBsc
- * @notice BSC 桥接合约：对接 BSC-USDT（0x55d3...7955）与 BSC-AUSD（需本桥为 owner 才能增发）。
+ * @notice BSC 桥接合约：对接 BSC-USDT（0x55d3...7955）与 BSC-AUSD（本桥需具备增发权限）。
  *
  * 流程（对应你的编号）：
  * - [1.1] user.depositUsdtToA(...)         : 用户把 BSC-USDT 转入桥合约，触发 event1
- * - [2.2] owner.releaseUsdtFromA(...)      : 监听 A 链 event2 后，从合约余额支付 USDT 给目标地址
+ * - [2.2] MINTER.releaseUsdtFromA(...)     : 监听 A 链 event2 后，从合约余额支付 USDT 给目标地址
  * - [3.1] user.depositAusdToA(...)         : 用户在 BSC 销毁 AUSD，触发 event3
- * - [4.2] owner.mintAusdFromA(...)         : 监听 A 链 event4 后，在 BSC 增发 AUSD 给目标地址
+ * - [4.2] MINTER.mintAusdFromA(...)        : 监听 A 链 event4 后，在 BSC 增发 AUSD 给目标地址
+ *
+ * 额外：
+ * - 默认超管（DEFAULT_ADMIN_ROLE）可调用 adminTransferAusdOwnership，把 AUSD 合约所有权转移。
  */
-contract BridgeBsc is Ownable, ReentrancyGuard {
+contract BridgeBsc is AccessControl, ReentrancyGuard {
+    /* --------------------- roles --------------------- */
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
     /* --------------------- external tokens --------------------- */
-    IERC20 public immutable usdtBsc;        // 0x55d398326f99059fF775485246999027B3197955
-    IERC20Burnable public immutable ausdBscBurnable; // 用于 burnFrom
-    IMintable public immutable ausdBscMintable;      // 用于 mint（要求本桥为 owner）
+    IERC20 public immutable usdtBsc;                      // 0x55d398326f99059fF775485246999027B3197955
+    IERC20Burnable public immutable ausdBscBurnable;      // 用于 burnFrom
+    IMintable      public immutable ausdBscMintable;      // 用于 mint（本桥应持有增发权限/owner）
 
     /* -------------------------- deposit ids -------------------------- */
     uint256 public nextDepositIdB2A_USDT; // BSC->A：USDT（event1 本地自增）
@@ -70,20 +61,26 @@ contract BridgeBsc is Ownable, ReentrancyGuard {
     // event3: BSC AUSD -> A（本合约触发）
     event Event3_AusdDepositOnBsc(address indexed user, uint256 indexed depositId, address indexed toOnA, uint256 amount);
 
-    // 对应 A 链提现完成的回执（可选）
+    // 对应 A 链提现/增发完成的回执（可选）
     event UsdtReleasedFromA(uint256 indexed originChainId, uint256 indexed depositId, address indexed to, uint256 amount);
     event AusdMintedFromA(uint256 indexed originChainId, uint256 indexed depositId, address indexed to, uint256 amount);
 
+    /* AUSD 所有权迁移（默认超管操作） */
+    event AusdOwnershipTransferred(address indexed newOwner);
+
     /* ------------------------------ ctor ------------------------------ */
     constructor(address ausdBsc_, address usdtBsc_) {
-        // usdtBsc_ 可传 0x55d3..., 也可留空用默认
         address _usdt = usdtBsc_ == address(0)
             ? 0x55d398326f99059fF775485246999027B3197955
             : usdtBsc_;
         require(ausdBsc_ != address(0), "ZERO_AUSD");
-        usdtBsc = IERC20(_usdt);
+
+        usdtBsc        = IERC20(_usdt);
         ausdBscBurnable = IERC20Burnable(ausdBsc_);
         ausdBscMintable = IMintable(ausdBsc_);
+
+        // 角色设置：部署者为默认超管
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
 
     /* ============================== USDT ============================== */
@@ -100,13 +97,13 @@ contract BridgeBsc is Ownable, ReentrancyGuard {
         emit Event1_UsdtDepositOnBsc(msg.sender, id, toOnA, amount);
     }
 
-    /// @notice [2.2] A -> BSC：监听 A 链 event2 后，仅 owner 可从本合约余额释放 USDT 给目标
+    /// @notice [2.2] A -> BSC：监听 A 链 event2 后，仅 MINTER_ROLE 可从本合约余额释放 USDT 给目标
     function releaseUsdtFromA(
         uint256 originChainId,  // A 链 chainId（你的私有链）
         uint256 depositIdOnA,   // A 链 event2 的 depositId
         address toOnBsc,
         uint256 amount
-    ) external onlyOwner nonReentrant {
+    ) external onlyRole(MINTER_ROLE) nonReentrant {
         require(toOnBsc != address(0), "ZERO_to");
         require(amount > 0, "ZERO_amt");
 
@@ -132,14 +129,13 @@ contract BridgeBsc is Ownable, ReentrancyGuard {
         emit Event3_AusdDepositOnBsc(msg.sender, id, toOnA, amount);
     }
 
-    /// @notice [4.2] A -> BSC：监听 A 链 event4 后，仅 owner 可在 BSC 增发 AUSD 给目标
-    /// @dev 需要确保本桥是 BSC-AUSD 的 owner（或其 mint 权限持有者）
+    /// @notice [4.2] A -> BSC：监听 A 链 event4 后，仅 MINTER_ROLE 可在 BSC 增发 AUSD 给目标
     function mintAusdFromA(
         uint256 originChainId,  // A 链 chainId
         uint256 depositIdOnA,   // A 链 event4 的 depositId
         address toOnBsc,
         uint256 amount
-    ) external onlyOwner nonReentrant {
+    ) external onlyRole(MINTER_ROLE) nonReentrant {
         require(toOnBsc != address(0), "ZERO_to");
         require(amount > 0, "ZERO_amt");
 
@@ -149,5 +145,17 @@ contract BridgeBsc is Ownable, ReentrancyGuard {
 
         ausdBscMintable.mint(toOnBsc, amount);
         emit AusdMintedFromA(originChainId, depositIdOnA, toOnBsc, amount);
+    }
+
+    /* ============================== 管理（默认超管） ============================== */
+
+    /// @notice 默认超管把 AUSD 合约的所有权转移给 newOwner（AUSD 需实现 Ownable 的 transferOwnership）
+    function adminTransferAusdOwnership(address newOwner)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(newOwner != address(0), "ZERO_ADDR");
+        IOwnableLike(address(ausdBscMintable)).transferOwnership(newOwner);
+        emit AusdOwnershipTransferred(newOwner);
     }
 }

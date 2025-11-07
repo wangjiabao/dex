@@ -22,6 +22,11 @@ interface IMintableBurnableERC20 is IERC20 {
     function burnFrom(address from, uint256 amount) external;
 }
 
+/* 用于调用 AUSD 的 setMinter */
+interface IAusdMinterAdmin {
+    function setMinter(address newMinter) external;
+}
+
 /**
  * @title BondingCurvePrimaryMarket (AUSD-side fees + AccessControl + Public Skim)
  * @notice 内部台账：X = x1 - x2；R = s1 - s2
@@ -29,8 +34,8 @@ interface IMintableBurnableERC20 is IERC20 {
  *         60.18 定点（UD60x18 / SD59x18）
  *
  * 费收规则（AUSD侧）：
- *  - 买：ΔX 为总铸造量；fee = floor(ΔX * buyRate/base)，铸给 feeRecipient；用户实收 ΔX - fee
- *  - 卖：用户交割 gross；fee = floor(gross * sellRate/base)，从用户转给 feeRecipient；净量 burn 决定 USDT 出金
+ *  - 买：ΔX 为总铸造量；fee = floor(ΔX * buyRate/buyBase)，铸给 feeRecipient；用户实收 ΔX - fee
+ *  - 卖：用户交割 gross；fee = floor(gross * sellRate/sellBase)，从用户转给 feeRecipient；净量 burn 决定 USDT 出金
  *
  * 报价：理论值（不考虑任何 FOT；且你已确认 USDT/AUSD 均为无FOT标准实现）
  */
@@ -47,7 +52,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     uint256 private constant TWO_THIRDS_CONST = 666_666_666_666_666_667; // 2/3 (60.18)
 
     // -------------------- Tokens --------------------
-    IERC20 public immutable usdt;                 // 18 decimals
+    IERC20 public immutable usdt;                 // 18 decimals（此处强制 18）
     IMintableBurnableERC20 public immutable ausd; // 18 decimals
 
     // -------------------- Curve params (60.18) --------------------
@@ -57,10 +62,13 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     uint256 public immutable C;          // (3 * sqrt(a)) / 2
     uint256 public immutable TWO_THIRDS; // 2/3
 
-    // -------------------- Fees (AUSD side) --------------------
-    uint256 public buyFeeRate  = 3;    // 默认 3/100
-    uint256 public sellFeeRate = 3;
-    uint256 public feeBase     = 100;
+    // -------------------- Fees （买卖分开 + 各自 base） --------------------
+    uint256 public buyFeeRate  = 3;     // 默认 3/100
+    uint256 public buyFeeBase  = 100;
+
+    uint256 public sellFeeRate = 3;     // 默认 3/100
+    uint256 public sellFeeBase = 100;
+
     address public feeRecipient;
 
     // -------------------- Internal ledger --------------------
@@ -70,7 +78,16 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     uint256 public x2; // 累计销毁 AUSD（只计净烧部分）
 
     // -------------------- Events --------------------
-    event FeesUpdated(uint256 buyRate, uint256 sellRate, uint256 base, address feeRecipient);
+    event FeesUpdated(
+        uint256 buyRate,
+        uint256 buyBase,
+        uint256 sellRate,
+        uint256 sellBase,
+        address feeRecipient
+    );
+
+    /* 记录 AUSD minter 更新 */
+    event AusdMinterUpdated(address indexed newMinter);
 
     event Bought(
         address indexed buyer,
@@ -110,7 +127,6 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         require(feeRecipient_ != address(0), "FEE_ZERO");
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        _grantRole(ADMIN_ROLE, admin);
 
         usdt = IERC20(usdt_);
         ausd = IMintableBurnableERC20(ausd_);
@@ -129,16 +145,53 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     }
 
     // -------------------- Admin ops --------------------
-    function setFees(uint256 _buyRate, uint256 _sellRate, uint256 _base, address _feeRecipient)
-        external onlyRole(ADMIN_ROLE)
-    {
-        require(_base > 0 && _buyRate < _base && _sellRate < _base, "FEE_CFG");
+    function setFees(
+        uint256 _buyRate,
+        uint256 _buyBase,
+        uint256 _sellRate,
+        uint256 _sellBase,
+        address _feeRecipient
+    ) external onlyRole(ADMIN_ROLE) {
+        require(_buyBase > 0 && _sellBase > 0, "BASE_ZERO");
+        require(_buyRate < _buyBase, "BUY_FEE_CFG");
+        require(_sellRate < _sellBase, "SELL_FEE_CFG");
         require(_feeRecipient != address(0), "FEE_ZERO");
+
         buyFeeRate  = _buyRate;
+        buyFeeBase  = _buyBase;
         sellFeeRate = _sellRate;
-        feeBase     = _base;
+        sellFeeBase = _sellBase;
         feeRecipient = _feeRecipient;
-        emit FeesUpdated(_buyRate, _sellRate, _base, _feeRecipient);
+
+        emit FeesUpdated(_buyRate, _buyBase, _sellRate, _sellBase, _feeRecipient);
+    }
+
+    /// 仅修改买入侧费率与基数
+    function setBuyFees(uint256 _buyRate, uint256 _buyBase) external onlyRole(ADMIN_ROLE) {
+        require(_buyBase > 0, "BASE_ZERO");
+        require(_buyRate < _buyBase, "BUY_FEE_CFG");
+        buyFeeRate = _buyRate;
+        buyFeeBase = _buyBase;
+        emit FeesUpdated(buyFeeRate, buyFeeBase, sellFeeRate, sellFeeBase, feeRecipient);
+    }
+
+    /// 仅修改卖出侧费率与基数
+    function setSellFees(uint256 _sellRate, uint256 _sellBase) external onlyRole(ADMIN_ROLE) {
+        require(_sellBase > 0, "BASE_ZERO");
+        require(_sellRate < _sellBase, "SELL_FEE_CFG");
+        sellFeeRate = _sellRate;
+        sellFeeBase = _sellBase;
+        emit FeesUpdated(buyFeeRate, buyFeeBase, sellFeeRate, sellFeeBase, feeRecipient);
+    }
+
+    /* 默认超管可调用，转发到 AUSD 合约的 setMinter */
+    function adminSetUsdtMinter(address newMinter)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(newMinter != address(0), "ZERO_ADDR");
+        IAusdMinterAdmin(address(ausd)).setMinter(newMinter);
+        emit AusdMinterUpdated(newMinter);
     }
 
     // -------------------- Views --------------------
@@ -201,7 +254,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         uint256 X  = internalSupply();
         uint256 Xn = supplyFromArea(areaOf(X) + usdtIn);
         ausdGrossOut = Xn - X;
-        ausdFee      = (ausdGrossOut * buyFeeRate) / feeBase; // floor
+        ausdFee      = (ausdGrossOut * buyFeeRate) / buyFeeBase; // floor
         ausdNetOut   = ausdGrossOut - ausdFee;
     }
 
@@ -210,8 +263,8 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         returns (uint256 usdtIn, uint256 ausdFee, uint256 ausdGross)
     {
         uint256 X  = internalSupply();
-        uint256 denom = feeBase - buyFeeRate;
-        ausdGross = _mulDivUp(ausdNetWant, feeBase, denom);
+        uint256 denom = buyFeeBase - buyFeeRate;
+        ausdGross = _mulDivUp(ausdNetWant, buyFeeBase, denom);
         usdtIn    = areaOf(X + ausdGross) - areaOf(X);
         ausdFee   = ausdGross - ausdNetWant;
     }
@@ -221,7 +274,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         returns (uint256 usdtOut, uint256 ausdFee, uint256 ausdBurn)
     {
         uint256 X  = internalSupply();
-        ausdFee    = (ausdGrossIn * sellFeeRate) / feeBase; // floor
+        ausdFee    = (ausdGrossIn * sellFeeRate) / sellFeeBase; // floor
         ausdBurn   = ausdGrossIn - ausdFee;
         require(ausdBurn <= X, "SELL_EXCEEDS_INTERNAL_SUPPLY");
         usdtOut    = areaOf(X) - areaOf(X - ausdBurn);
@@ -236,8 +289,8 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         require(usdtOut <= Sprev, "EXCEEDS_INTERNAL_RESERVE");
         uint256 Xnew  = supplyFromArea(Sprev - usdtOut);
         ausdBurn      = X - Xnew;
-        uint256 denom = feeBase - sellFeeRate;
-        ausdGrossIn   = _mulDivUp(ausdBurn, feeBase, denom);
+        uint256 denom = sellFeeBase - sellFeeRate;
+        ausdGrossIn   = _mulDivUp(ausdBurn, sellFeeBase, denom);
         ausdFee       = ausdGrossIn - ausdBurn;
     }
 
@@ -248,7 +301,9 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         external nonReentrant returns (uint256 ausdNetOut)
     {
         require(usdtIn > 0, "ZERO_IN");
-        require(to != address(0) && feeRecipient != address(0), "ZERO_ADDR");
+        require(feeRecipient != address(0), "FEE_ZERO");
+
+        address _to = to == address(0) ? msg.sender : to;
 
         // 收款（标准ERC20，无FOT）
         require(usdt.transferFrom(msg.sender, address(this), usdtIn), "TF_FROM");
@@ -258,7 +313,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         uint256 Xn      = supplyFromArea(areaOf(X) + usdtIn);
         uint256 dX      = Xn - X;
 
-        uint256 feeA    = (dX * buyFeeRate) / feeBase;
+        uint256 feeA    = (dX * buyFeeRate) / buyFeeBase;
         ausdNetOut      = dX - feeA;
         require(ausdNetOut >= minAusdNetOut, "SLIPPAGE");
 
@@ -268,9 +323,9 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
 
         // 铸币：手续费 + 用户
         if (feeA > 0) ausd.mint(feeRecipient, feeA);
-        ausd.mint(to, ausdNetOut);
+        ausd.mint(_to, ausdNetOut);
 
-        emit Bought(msg.sender, to, usdtIn, dX, feeA, ausdNetOut, price0, priceAtSupply(Xn));
+        emit Bought(msg.sender, _to, usdtIn, dX, feeA, ausdNetOut, price0, priceAtSupply(Xn));
     }
 
     /// 买（精确拿净 AUSD）：按理论 need 收款并推进，避免粉尘
@@ -278,12 +333,14 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         external nonReentrant returns (uint256 usdtUsed)
     {
         require(ausdNetOut > 0, "ZERO_OUT");
-        require(to != address(0) && feeRecipient != address(0), "ZERO_ADDR");
+        require(feeRecipient != address(0), "FEE_ZERO");
+
+        address _to = to == address(0) ? msg.sender : to;
 
         uint256 X      = internalSupply();
         uint256 price0 = priceAtSupply(X);
-        uint256 denom  = feeBase - buyFeeRate;
-        uint256 dX     = _mulDivUp(ausdNetOut, feeBase, denom);
+        uint256 denom  = buyFeeBase - buyFeeRate;
+        uint256 dX     = _mulDivUp(ausdNetOut, buyFeeBase, denom);
         usdtUsed       = areaOf(X + dX) - areaOf(X);
         require(usdtUsed <= maxUsdtIn, "SLIPPAGE");
 
@@ -296,9 +353,9 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
 
         uint256 feeA = dX - ausdNetOut;
         if (feeA > 0) ausd.mint(feeRecipient, feeA);
-        ausd.mint(to, ausdNetOut);
+        ausd.mint(_to, ausdNetOut);
 
-        emit Bought(msg.sender, to, usdtUsed, dX, feeA, ausdNetOut, price0, priceAtSupply(X + dX));
+        emit Bought(msg.sender, _to, usdtUsed, dX, feeA, ausdNetOut, price0, priceAtSupply(X + dX));
     }
 
     /// 卖（简单）：输入总量，扣手续费给 feeRecipient，净量 burn，按净烧放 USDT
@@ -306,12 +363,14 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         external nonReentrant returns (uint256 usdtOut)
     {
         require(ausdGrossIn > 0, "ZERO_IN");
-        require(to != address(0) && feeRecipient != address(0), "ZERO_ADDR");
+        require(feeRecipient != address(0), "FEE_ZERO");
+
+        address _to = to == address(0) ? msg.sender : to;
 
         uint256 X      = internalSupply();
         uint256 price0 = priceAtSupply(X);
 
-        uint256 feeA   = (ausdGrossIn * sellFeeRate) / feeBase;
+        uint256 feeA   = (ausdGrossIn * sellFeeRate) / sellFeeBase;
         uint256 burnX  = ausdGrossIn - feeA;
         require(burnX <= X, "SELL_EXCEEDS_INTERNAL_SUPPLY");
 
@@ -330,9 +389,9 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         s2 += usdtOut;
         x2 += burnX;
 
-        require(usdt.transfer(to, usdtOut), "TF_OUT");
+        require(usdt.transfer(_to, usdtOut), "TF_OUT");
 
-        emit Sold(msg.sender, to, ausdGrossIn, feeA, burnX, usdtOut, price0, priceAtSupply(X - burnX));
+        emit Sold(msg.sender, _to, ausdGrossIn, feeA, burnX, usdtOut, price0, priceAtSupply(X - burnX));
     }
 
     /// 卖（精确 USDT）：先反推净烧，再上翻总交割；手续费转走，净量烧毁
@@ -340,7 +399,9 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         external nonReentrant returns (uint256 ausdGrossIn)
     {
         require(usdtOut > 0, "ZERO_OUT");
-        require(to != address(0) && feeRecipient != address(0), "ZERO_ADDR");
+        require(feeRecipient != address(0), "FEE_ZERO");
+
+        address _to = to == address(0) ? msg.sender : to;
 
         uint256 X      = internalSupply();
         uint256 Sprev  = areaOf(X);
@@ -350,8 +411,8 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         uint256 Xnew   = supplyFromArea(Sprev - usdtOut);
         uint256 burnX  = X - Xnew;
 
-        uint256 denom  = feeBase - sellFeeRate;
-        ausdGrossIn    = _mulDivUp(burnX, feeBase, denom);
+        uint256 denom  = sellFeeBase - sellFeeRate;
+        ausdGrossIn    = _mulDivUp(burnX, sellFeeBase, denom);
         require(ausdGrossIn <= maxAusdGrossIn, "SLIPPAGE");
         uint256 feeA   = ausdGrossIn - burnX;
 
@@ -363,15 +424,15 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         s2 += usdtOut;
         x2 += burnX;
 
-        require(usdt.transfer(to, usdtOut), "TF_OUT");
+        require(usdt.transfer(_to, usdtOut), "TF_OUT");
 
-        emit Sold(msg.sender, to, ausdGrossIn, feeA, burnX, usdtOut, price0, priceAtSupply(Xnew));
+        emit Sold(msg.sender, _to, ausdGrossIn, feeA, burnX, usdtOut, price0, priceAtSupply(Xnew));
     }
 
     // -------------------- Dust handling (public skim) --------------------
 
-    /// 任何人可提走“真实余额 - 模型储备”的正差额，并同步台账（视为一次真实出金）
-    function skimExcessPublic() external nonReentrant returns (uint256 amount) {
+    /// 可提走“真实余额 - 模型储备”的正差额，并同步台账（视为一次真实出金）
+    function skimExcess() external onlyRole(ADMIN_ROLE) nonReentrant returns (uint256 amount) {
         uint256 realR  = realReserve();
         uint256 modelR = modeledReserve();
         require(realR > modelR, "NO_EXCESS");
