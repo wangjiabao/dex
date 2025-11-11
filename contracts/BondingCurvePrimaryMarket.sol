@@ -42,9 +42,6 @@ interface IAusdMinterAdmin {
 contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     using PRBMathUD60x18 for uint256;
 
-    // -------------------- Roles --------------------
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-
     // -------------------- 60.18 常量 --------------------
     uint256 private constant ONE   = 1e18;
     uint256 private constant TWO   = 2e18;
@@ -151,7 +148,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
         uint256 _sellRate,
         uint256 _sellBase,
         address _feeRecipient
-    ) external onlyRole(ADMIN_ROLE) {
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_buyBase > 0 && _sellBase > 0, "BASE_ZERO");
         require(_buyRate < _buyBase, "BUY_FEE_CFG");
         require(_sellRate < _sellBase, "SELL_FEE_CFG");
@@ -167,7 +164,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     }
 
     /// 仅修改买入侧费率与基数
-    function setBuyFees(uint256 _buyRate, uint256 _buyBase) external onlyRole(ADMIN_ROLE) {
+    function setBuyFees(uint256 _buyRate, uint256 _buyBase) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_buyBase > 0, "BASE_ZERO");
         require(_buyRate < _buyBase, "BUY_FEE_CFG");
         buyFeeRate = _buyRate;
@@ -176,7 +173,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     }
 
     /// 仅修改卖出侧费率与基数
-    function setSellFees(uint256 _sellRate, uint256 _sellBase) external onlyRole(ADMIN_ROLE) {
+    function setSellFees(uint256 _sellRate, uint256 _sellBase) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_sellBase > 0, "BASE_ZERO");
         require(_sellRate < _sellBase, "SELL_FEE_CFG");
         sellFeeRate = _sellRate;
@@ -432,7 +429,7 @@ contract BondingCurvePrimaryMarket is AccessControl, ReentrancyGuard {
     // -------------------- Dust handling (public skim) --------------------
 
     /// 可提走“真实余额 - 模型储备”的正差额，并同步台账（视为一次真实出金）
-    function skimExcess() external onlyRole(ADMIN_ROLE) nonReentrant returns (uint256 amount) {
+    function skimExcess() external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant returns (uint256 amount) {
         uint256 realR  = realReserve();
         uint256 modelR = modeledReserve();
         require(realR > modelR, "NO_EXCESS");

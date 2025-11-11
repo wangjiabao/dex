@@ -25,48 +25,58 @@ interface IOwnableLike {
 }
 
 /**
- * @title BridgeBsc
- * @notice BSC 桥接合约：对接 BSC-USDT（0x55d3...7955）与 BSC-AUSD（本桥需具备增发权限）。
- *
- * 流程（对应你的编号）：
- * - [1.1] user.depositUsdtToA(...)         : 用户把 BSC-USDT 转入桥合约，触发 event1
- * - [2.2] MINTER.releaseUsdtFromA(...)     : 监听 A 链 event2 后，从合约余额支付 USDT 给目标地址
- * - [3.1] user.depositAusdToA(...)         : 用户在 BSC 销毁 AUSD，触发 event3
- * - [4.2] MINTER.mintAusdFromA(...)        : 监听 A 链 event4 后，在 BSC 增发 AUSD 给目标地址
- *
- * 额外：
- * - 默认超管（DEFAULT_ADMIN_ROLE）可调用 adminTransferAusdOwnership，把 AUSD 合约所有权转移。
+ * @title BridgeBsc (with fee fields merged)
  */
 contract BridgeBsc is AccessControl, ReentrancyGuard {
     /* --------------------- roles --------------------- */
-    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant MINTER_ROLE   = keccak256("MINTER_ROLE");
+    bytes32 public constant WITHDRAW_ROLE = keccak256("WITHDRAW_ROLE");
 
     /* --------------------- external tokens --------------------- */
-    IERC20 public immutable usdtBsc;                      // 0x55d398326f99059fF775485246999027B3197955
-    IERC20Burnable public immutable ausdBscBurnable;      // 用于 burnFrom
-    IMintable      public immutable ausdBscMintable;      // 用于 mint（本桥应持有增发权限/owner）
+    IERC20 public immutable usdtBsc;
+    IERC20Burnable public immutable ausdBscBurnable;
+    IMintable      public immutable ausdBscMintable;
 
     /* -------------------------- deposit ids -------------------------- */
-    uint256 public nextDepositIdB2A_USDT; // BSC->A：USDT（event1 本地自增）
-    uint256 public nextDepositIdB2A_AUSD; // BSC->A：AUSD（event3 本地自增）
+    uint256 public nextDepositIdB2A_USDT;
+    uint256 public nextDepositIdB2A_AUSD;
 
-    /* ----------------------- processed (replay-guard) ----------------------- */
-    mapping(bytes32 => bool) public processed; 
-    // key = keccak256(abi.encodePacked(flowTag, originChainId, depositId))
+    /* ----------------------- processed ----------------------- */
+    mapping(bytes32 => bool) public processed;
+
+    /* ------------------------------ fee config ------------------------------ */
+    uint256 public usdtFeeRate;
+    uint256 public usdtFeeBase;
+    uint256 public ausdFeeRate;
+    uint256 public ausdFeeBase;
+    uint256 public nativeFeeWei;
 
     /* ------------------------------ events ------------------------------ */
-    // event1: BSC USDT -> A（本合约触发）
-    event Event1_UsdtDepositOnBsc(address indexed user, uint256 indexed depositId, address indexed toOnA, uint256 amount);
+    // 追加字段 feeToken, feeNative
+    event Event1_UsdtDepositOnBsc(
+        address indexed user,
+        uint256 indexed depositId,
+        address indexed toOnA,
+        uint256 amountNet,
+        uint256 feeToken,
+        uint256 feeNative
+    );
 
-    // event3: BSC AUSD -> A（本合约触发）
-    event Event3_AusdDepositOnBsc(address indexed user, uint256 indexed depositId, address indexed toOnA, uint256 amount);
+    event Event3_AusdDepositOnBsc(
+        address indexed user,
+        uint256 indexed depositId,
+        address indexed toOnA,
+        uint256 amountNet,
+        uint256 feeToken,
+        uint256 feeNative
+    );
 
-    // 对应 A 链提现/增发完成的回执（可选）
     event UsdtReleasedFromA(uint256 indexed originChainId, uint256 indexed depositId, address indexed to, uint256 amount);
-    event AusdMintedFromA(uint256 indexed originChainId, uint256 indexed depositId, address indexed to, uint256 amount);
-
-    /* AUSD 所有权迁移（默认超管操作） */
+    event AusdMintedFromA  (uint256 indexed originChainId, uint256 indexed depositId, address indexed to, uint256 amount);
     event AusdOwnershipTransferred(address indexed newOwner);
+    event UsdtFeeUpdated(uint256 rate, uint256 base);
+    event AusdFeeUpdated(uint256 rate, uint256 base);
+    event NativeFeeUpdated(uint256 nativeFeeWei);
 
     /* ------------------------------ ctor ------------------------------ */
     constructor(address ausdBsc_, address usdtBsc_) {
@@ -75,32 +85,48 @@ contract BridgeBsc is AccessControl, ReentrancyGuard {
             : usdtBsc_;
         require(ausdBsc_ != address(0), "ZERO_AUSD");
 
-        usdtBsc        = IERC20(_usdt);
+        usdtBsc         = IERC20(_usdt);
         ausdBscBurnable = IERC20Burnable(ausdBsc_);
         ausdBscMintable = IMintable(ausdBsc_);
 
-        // 角色设置：部署者为默认超管
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
 
-    /* ============================== USDT ============================== */
+    /* ============================== FEE VIEW ============================== */
 
-    /// @notice [1.1] BSC -> A：用户授权后把 USDT 转入桥合约，触发 event1
+    function quoteUsdtFee(uint256 amount) public view returns (uint256 fee, uint256 net) {
+        fee = (usdtFeeRate > 0 && usdtFeeBase > 0) ? (amount * usdtFeeRate) / usdtFeeBase : 0;
+        net = amount - fee;
+    }
+
+    function quoteAusdFee(uint256 amount) public view returns (uint256 fee, uint256 net) {
+        fee = (ausdFeeRate > 0 && ausdFeeBase > 0) ? (amount * ausdFeeRate) / ausdFeeBase : 0;
+        net = amount - fee;
+    }
+
+    /* ============================== USDT (BSC->A) ============================== */
+
     function depositUsdtToA(uint256 amount, address toOnA)
         external
+        payable
         nonReentrant
     {
         require(toOnA != address(0), "ZERO_to");
         require(amount > 0, "ZERO_amt");
-        require(usdtBsc.transferFrom(msg.sender, address(this), amount), "TFR_FAIL");
+        require(msg.value == nativeFeeWei, "BAD_NATIVE_FEE");
+
+        (uint256 fee, uint256 net) = quoteUsdtFee(amount);
+        require(net > 0, "FEE_GE_AMT");
+
+        require(usdtBsc.transferFrom(msg.sender, address(this), amount), "USDT_TFR_FAIL");
+
         uint256 id = ++nextDepositIdB2A_USDT;
-        emit Event1_UsdtDepositOnBsc(msg.sender, id, toOnA, amount);
+        emit Event1_UsdtDepositOnBsc(msg.sender, id, toOnA, net, fee, nativeFeeWei);
     }
 
-    /// @notice [2.2] A -> BSC：监听 A 链 event2 后，仅 MINTER_ROLE 可从本合约余额释放 USDT 给目标
     function releaseUsdtFromA(
-        uint256 originChainId,  // A 链 chainId（你的私有链）
-        uint256 depositIdOnA,   // A 链 event2 的 depositId
+        uint256 originChainId,
+        uint256 depositIdOnA,
         address toOnBsc,
         uint256 amount
     ) external onlyRole(MINTER_ROLE) nonReentrant {
@@ -111,28 +137,37 @@ contract BridgeBsc is AccessControl, ReentrancyGuard {
         require(!processed[key], "ALREADY_DONE");
         processed[key] = true;
 
-        require(usdtBsc.transfer(toOnBsc, amount), "TFR_FAIL");
+        require(usdtBsc.transfer(toOnBsc, amount), "USDT_TFR_FAIL");
         emit UsdtReleasedFromA(originChainId, depositIdOnA, toOnBsc, amount);
     }
 
-    /* ============================== AUSD ============================== */
+    /* ============================== AUSD (BSC->A) ============================== */
 
-    /// @notice [3.1] BSC -> A：用户授权后，销毁其 BSC-AUSD，触发 event3
     function depositAusdToA(uint256 amount, address toOnA)
         external
+        payable
         nonReentrant
     {
         require(toOnA != address(0), "ZERO_to");
         require(amount > 0, "ZERO_amt");
-        ausdBscBurnable.burnFrom(msg.sender, amount);
+        require(msg.value == nativeFeeWei, "BAD_NATIVE_FEE");
+
+        (uint256 fee, uint256 net) = quoteAusdFee(amount);
+        require(net > 0, "FEE_GE_AMT");
+
+        if (fee > 0) {
+            require(ausdBscBurnable.transferFrom(msg.sender, address(this), fee), "AUSD_FEE_TFR_FAIL");
+        }
+
+        ausdBscBurnable.burnFrom(msg.sender, net);
+
         uint256 id = ++nextDepositIdB2A_AUSD;
-        emit Event3_AusdDepositOnBsc(msg.sender, id, toOnA, amount);
+        emit Event3_AusdDepositOnBsc(msg.sender, id, toOnA, net, fee, nativeFeeWei);
     }
 
-    /// @notice [4.2] A -> BSC：监听 A 链 event4 后，仅 MINTER_ROLE 可在 BSC 增发 AUSD 给目标
     function mintAusdFromA(
-        uint256 originChainId,  // A 链 chainId
-        uint256 depositIdOnA,   // A 链 event4 的 depositId
+        uint256 originChainId,
+        uint256 depositIdOnA,
         address toOnBsc,
         uint256 amount
     ) external onlyRole(MINTER_ROLE) nonReentrant {
@@ -147,9 +182,8 @@ contract BridgeBsc is AccessControl, ReentrancyGuard {
         emit AusdMintedFromA(originChainId, depositIdOnA, toOnBsc, amount);
     }
 
-    /* ============================== 管理（默认超管） ============================== */
+    /* ============================== 管理 ============================== */
 
-    /// @notice 默认超管把 AUSD 合约的所有权转移给 newOwner（AUSD 需实现 Ownable 的 transferOwnership）
     function adminTransferAusdOwnership(address newOwner)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -158,4 +192,36 @@ contract BridgeBsc is AccessControl, ReentrancyGuard {
         IOwnableLike(address(ausdBscMintable)).transferOwnership(newOwner);
         emit AusdOwnershipTransferred(newOwner);
     }
+
+    function setUsdtFee(uint256 rate, uint256 base) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        usdtFeeRate = rate;
+        usdtFeeBase = base;
+        emit UsdtFeeUpdated(rate, base);
+    }
+
+    function setAusdFee(uint256 rate, uint256 base) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        ausdFeeRate = rate;
+        ausdFeeBase = base;
+        emit AusdFeeUpdated(rate, base);
+    }
+
+    function setNativeFeeWei(uint256 feeWei) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        nativeFeeWei = feeWei;
+        emit NativeFeeUpdated(feeWei);
+    }
+
+    /* ============================== 提现 ============================== */
+
+    function withdrawERC20(address token, address to, uint256 amount) external onlyRole(WITHDRAW_ROLE) nonReentrant {
+        require(to != address(0), "ZERO_to");
+        require(IERC20(token).transfer(to, amount), "ERC20_TFR_FAIL");
+    }
+
+    function withdrawNative(address payable to, uint256 amount) external onlyRole(WITHDRAW_ROLE) nonReentrant {
+        require(to != address(0), "ZERO_to");
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "NATIVE_TFR_FAIL");
+    }
+
+    receive() external payable {}
 }
